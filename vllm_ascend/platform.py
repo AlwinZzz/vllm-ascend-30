@@ -35,6 +35,7 @@ os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 from vllm_ascend.ascend_config import KVPPConfig, StairConfig, get_ascend_config, init_ascend_config
 from vllm_ascend.device.hardware_profile import (
     AttentionBackendFamily,
+    DeviceAdaptorFamily,
     HardwareCapability,
     QuantizationBackendFamily,
     get_current_hardware_profile,
@@ -125,6 +126,13 @@ class NPUPlatform(Platform):
     @classmethod
     def manual_seed_all(cls, seed: int) -> None:
         pass
+
+    @classmethod
+    def register_triton_kernel_overrides(cls) -> None:
+        if get_current_hardware_profile().device_adaptor_family is DeviceAdaptorFamily.COMPATIBILITY:
+            from vllm_ascend._310p.worker.v2.sample.dispatch import register_sampling_kernel_overrides
+
+            register_sampling_kernel_overrides()
 
     @classmethod
     def get_kv_cache_config_builder_cls(cls, vllm_config: VllmConfig) -> str:
@@ -458,6 +466,18 @@ class NPUPlatform(Platform):
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
+        cache_config = vllm_config.cache_config
+        model_config = vllm_config.model_config
+        # DeepSeek V4 keys its page-padding tables on the physical block size, which
+        # check_and_update_config has already settled, and nothing this hook would do
+        # applies to it. The parent's Phase 1 would replace that size with one derived from
+        # get_supported_kernel_block_sizes(), and the compressed cache backends answer that
+        # in logical units -- AscendDSAC128Backend reports 4096 for the same physical page.
+        # Phase 2 is for hybrid models, Phase 3 for mixed KV dtypes, and the mamba handling
+        # below is gated on mamba_cache_mode; none of those is a DeepSeek V4 configuration.
+        if model_config is not None and model_config.hf_config.model_type == "deepseek_v4":
+            return
+
         super().update_block_size_for_backend(vllm_config)
 
         # TODO: NPU still sets block_size in check_and_update_config.
@@ -465,8 +485,6 @@ class NPUPlatform(Platform):
         using_kv_transfer_with_hybrid = (
             not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager and vllm_config.kv_transfer_config
         )
-        cache_config = vllm_config.cache_config
-        model_config = vllm_config.model_config
         if (
             not cache_config.enable_prefix_caching
             and using_kv_transfer_with_hybrid
@@ -1439,7 +1457,7 @@ def _setup_compile_backend(
                 "vllm::mla_forward",
                 "vllm::dsa_forward",
                 "vllm::minimax_m3_fused_sparse_forward",
-                "vllm::glm5next_kda_forward",
+                "vllm::glm5next_kda_forward_with_output",
             ]
         )
         additional_config["ascend_compilation_config"]["enable_npugraph_ex"] = False
@@ -1663,16 +1681,17 @@ def _is_supported_flash_attn_draft(spec: SpeculativeConfig, model_tag: str) -> b
             and "DFlash2DraftModel" in (spec.draft_model_config.architectures or ())
         )
     if spec.method == "dspark":
+        supported_target_architectures = _MINIMAX_M3_ARCHITECTURES | {"GlmMoeDsaForCausalLM"}
         return (
             model_tag == "dspark_head"
-            and not _MINIMAX_M3_ARCHITECTURES.isdisjoint(target.hf_config.architectures or ())
+            and not supported_target_architectures.isdisjoint(target.hf_config.architectures or ())
             and "Qwen3DSparkModel" in (spec.draft_model_config.architectures or ())
         )
     return False
 
 
 def _validate_flash_attn_backend(backend_key, selector) -> bool:
-    """Select CANN FlashAttn for A5 GLM DFlash2 and MiniMax-M3 DSpark drafts."""
+    """Select CANN FlashAttn for A5 GLM DFlash2 and GLM/MiniMax DSpark drafts."""
     # backend_key is (use_mla, use_sparse, use_compress).
     if backend_key != (False, False, False) or not get_current_hardware_profile().supports(
         HardwareCapability.DEVICE_LENGTH_FLASH_ATTN
@@ -1687,9 +1706,12 @@ def _validate_flash_attn_backend(backend_key, selector) -> bool:
     if spec is None or not _is_supported_flash_attn_draft(spec, backends.model_tag):
         return False
 
+    from vllm_ascend.attention.fa_v1 import AscendFlashAttentionBackend
+
     return (
+        selector.head_size in AscendFlashAttentionBackend.get_supported_head_sizes()
         # CANN FlashAttn requires FP16/BF16 Q and unquantized KV.
-        selector.dtype in (torch.float16, torch.bfloat16)
+        and selector.dtype in (torch.float16, torch.bfloat16)
         and selector.kv_cache_dtype in (None, "auto", "float16", "bfloat16")
         # These features require additional metadata or batch-invariance guarantees.
         and not (
@@ -1827,9 +1849,10 @@ def _validate_engram_config(vllm_config: VllmConfig) -> None:
         "Qwen4ExpForCausalLM",
         "Qwen4ExpForConditionalGeneration",
     ):
-        # Qwen4Exp PLE is managed by its model-specific implementation, not
-        # the DeepSeek V4.1 Engram runtime.
-        vllm_config.engram_config = None
+        # Qwen4Exp PLE is managed by its model-specific implementation and the
+        # upstream ngram_embedding, which reads engram_config directly. Keep the
+        # config flowing to upstream instead of clearing it; model/layer/device
+        # validation is already patched in patch_engram_config.py.
         return
     if engram_config is None:
         if (
@@ -1858,8 +1881,8 @@ def _validate_engram_config(vllm_config: VllmConfig) -> None:
     ):
         raise ValueError("Ascend Engram requires TP=1/2/4/8 with PP=DCP=1.")
     load_format = vllm_config.load_config.load_format
-    if load_format not in ("auto", "safetensors", "dummy"):
-        raise ValueError("Ascend Engram requires indexed safetensors (auto/safetensors), or dummy weights.")
+    if load_format not in ("auto", "safetensors", "rfork", "dummy"):
+        raise ValueError("Ascend Engram requires indexed safetensors (auto/safetensors/rfork), or dummy weights.")
 
 
 def _validate_parallel_config(vllm_config: VllmConfig) -> None:

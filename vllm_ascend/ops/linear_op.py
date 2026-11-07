@@ -48,7 +48,7 @@ from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import logger
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-from vllm.models.common.ops.sequence_parallel import sp_reduce_scatter
+from vllm_ascend.models.common.ops.sequence_parallel import sp_reduce_scatter
 
 from vllm_ascend.distributed.parallel_state import (
     get_mlp_tp_group,

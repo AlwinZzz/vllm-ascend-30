@@ -3,7 +3,9 @@
 """CPU numerical and contract tests; no vLLM installation or NPU required."""
 
 import ast
+import importlib.util
 import runpy
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -12,7 +14,14 @@ import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[3]
-backend = SimpleNamespace(**runpy.run_path(str(ROOT / "vllm_ascend/ops/kimi_attn_res.py")))
+# Dynamo resolves function globals by module name. runpy's <run_path> is not
+# importable in PyTorch 2.10; register a real module without importing the NPU plugin.
+_backend_spec = importlib.util.spec_from_file_location(
+    "_kimi_attn_res_test_backend", ROOT / "vllm_ascend/ops/kimi_attn_res.py"
+)
+backend = importlib.util.module_from_spec(_backend_spec)
+sys.modules[_backend_spec.name] = backend
+_backend_spec.loader.exec_module(backend)
 
 
 def reference(rows, partial, query, epsilon):
@@ -75,7 +84,7 @@ def test_phase1_is_reused_and_never_cached_across_forwards(monkeypatch):
     projection = SimpleNamespace(weight=torch.ones(1, 4))
     norm = SimpleNamespace(weight=torch.ones(4), variance_epsilon=1e-6)
     plan = backend.AttnResQueryPlan([(projection, norm, 1)] * 3 + [(projection, norm, 2)])
-    # Functions loaded by runpy share a globals dict, independently of this namespace.
+    # The backend methods share their module's globals dictionary.
     prepare_globals = backend.AttnResBackend._materialize.__globals__
     prepare = MagicMock(wraps=prepare_globals["prepare_attn_res_phase1"])
     monkeypatch.setitem(prepare_globals, "prepare_attn_res_phase1", prepare)
@@ -267,7 +276,8 @@ def test_fused_flag_defaults_to_enabled_and_can_disable(monkeypatch):
     assert env_namespace["env_variables"][name]() is False
 
 
-def test_fused_dispatch_is_capturable_without_python_fallback(fused_ops):
+@pytest.mark.parametrize("compile_backend", ["eager", "aot_eager"])
+def test_fused_dispatch_is_capturable_without_python_fallback(fused_ops, compile_backend):
     def prepare(values, count, queries, eps):
         return backend.prepare_attn_res_phase1(values, queries, eps)
 
@@ -301,24 +311,26 @@ def test_fused_dispatch_is_capturable_without_python_fallback(fused_ops):
             output_norm_weight=norm.weight,
         )[0]
 
-    compiled = torch.compile(forward, backend="eager", fullgraph=True)
+    compiled = torch.compile(forward, backend=compile_backend, fullgraph=True)
     for _ in range(2):
         prefix, delta = torch.randn(2, 4).bfloat16(), torch.randn(2, 4).bfloat16()
         bank = torch.randn(2, 1, 4).bfloat16()
         torch.testing.assert_close(compiled(prefix, delta, bank), forward(prefix, delta, bank))
 
 
-def test_two_phase_forward_cache_supports_full_graph_capture():
+@pytest.mark.parametrize("mode", ["two_phase", "original"])
+@pytest.mark.parametrize("compile_backend", ["eager", "aot_eager"])
+def test_two_phase_forward_cache_supports_full_graph_capture(mode, compile_backend):
     projection = SimpleNamespace(weight=torch.ones(1, 4))
     norm = SimpleNamespace(weight=torch.ones(4), variance_epsilon=1e-6)
     plan = backend.AttnResQueryPlan([(projection, norm, 1)] * 2)
 
     def forward(partial, delta, bank):
-        op = backend.AttnResBackend("two_phase", plan)
+        op = backend.AttnResBackend(mode, plan)
         output, raw, _ = op(partial, delta, bank, projection.weight, norm.weight, 1e-6, 1)
         return op(raw, output, bank, projection.weight, norm.weight, 1e-6, 1)[0]
 
-    compiled = torch.compile(forward, backend="eager", fullgraph=True)
+    compiled = torch.compile(forward, backend=compile_backend, fullgraph=True)
     for _ in range(2):
         partial, delta = torch.randn(2, 4), torch.randn(2, 4)
         bank = torch.randn(2, 1, 4)

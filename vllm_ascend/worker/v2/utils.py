@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.compilation import breakable_cudagraph
+from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import logger
 from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
 
@@ -15,6 +16,7 @@ from vllm_ascend.compilation.acl_graph import (
     get_graph_params,
     weak_ref_workspaces,
 )
+from vllm_ascend.compilation.kimi_moe_superkernel import optimize_moe_superkernel, use_kimi_moe_superkernel
 from vllm_ascend.compilation.updatable_graph import UpdatableGraph
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
 from vllm_ascend.utils import super_kernel_scope, weak_ref_tensor, weak_ref_tensors
@@ -196,12 +198,20 @@ def torch_npu_graph_wrapper(*args, **kwargs):
     # MRV2-specific cleanup hook: intentionally reuse the graph context
     # manager's exit to weak-ref graph workspaces after each capture,
     # without adding another upstream monkey patch.
-    enable_super_kernel = get_ascend_config().ascend_compilation_config.enable_super_kernel
+    ascend_config = get_ascend_config()
+    enable_super_kernel = ascend_config.ascend_compilation_config.enable_super_kernel
+    vllm_config = get_current_vllm_config_or_none() if enable_super_kernel else None
+    enable_moe_superkernel = vllm_config is not None and use_kimi_moe_superkernel(vllm_config, ascend_config)
+    # Named scopes own Kimi capture, including prefill/draft graphs that
+    # contain no eligible scope and must not fall back to whole-model fusion.
+    enable_super_kernel = enable_super_kernel and not enable_moe_superkernel
     graph = args[0] if args else (kwargs.get("cuda_graph") or kwargs.get("graph"))
     try:
         with torch.npu.graph(*args, **kwargs), super_kernel_scope("full_model", enable_super_kernel):
             yield
-        if enable_super_kernel and graph is not None:
+        if enable_moe_superkernel and graph is not None:
+            optimize_moe_superkernel(graph)
+        elif enable_super_kernel and graph is not None:
             graph.super_kernel_optimize(
                 optimize_options={
                     "dcci_after_kernel_end": [".*"],

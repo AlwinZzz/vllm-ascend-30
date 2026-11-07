@@ -16,6 +16,7 @@ from typing import Any, TypeVar, cast
 import torch
 import vllm.envs as envs
 from torch import nn
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig
 from vllm.distributed import (
     get_pp_group,
@@ -52,7 +53,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
-from vllm.models.common.ops.sequence_parallel import (
+from vllm_ascend.models.common.ops.sequence_parallel import (
     sp_all_gather,
     sp_padding_mask,
     sp_reduce_scatter,
@@ -90,6 +91,7 @@ from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.utils import mark_fused_preprocess_weights
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.ops.fused_moe.shared_experts import AscendSharedSparseSituAndMul
 from vllm_ascend.ops.kimi_attn_res import (
     AttnResBackend,
     AttnResQueryPlan,
@@ -99,6 +101,7 @@ from vllm_ascend.ops.kimi_attn_res import (
 from vllm_ascend.ops.kimi_kda import (
     AscendKimiK3DeltaAttention as AscendKimiK3DeltaAttentionBase,
 )
+from vllm_ascend.ops.kimi_situ import initialize_kimi_situ_ops
 from vllm_ascend.ops.linear_op import KimiOProjMMReduceScatterOp
 from vllm_ascend.quantization.methods.base import PreparedLinearInput
 from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
@@ -169,8 +172,8 @@ class AscendKimiK3DeltaAttention(AscendKimiK3DeltaAttentionBase):
     def __init__(self, config, vllm_config, prefix: str = "") -> None:
         super().__init__(config, vllm_config, prefix)
         if self.uses_mixed_projection:
-            # Set before weight loading so fused QKV uses the same NZ GMM
-            # layout as the routed projections.
+            # Keep the single-group NZ layout for the eager fused QKV path.
+            # Latent MoE projections use ordinary NZ Quant Matmul instead.
             self.in_proj_qkvgfab._single_group_gmm_nz = True
 
     def _matmul_fused_qkv(
@@ -369,6 +372,11 @@ class AscendKimiMoE(nn.Module):
         activation_situ_beta = config.activation_situ_beta if config.hidden_act == "situ" else None
         activation_situ_linear_beta = config.activation_situ_linear_beta if config.hidden_act == "situ" else None
 
+        if config.hidden_act == "situ" and get_current_hardware_profile().supports(
+            HardwareCapability.CANN_MEGAMOE_MXFP
+        ):
+            initialize_kimi_situ_ops()
+
         self.gate = GateLinear(
             input_size=hidden_size,
             output_size=num_experts,
@@ -389,6 +397,15 @@ class AscendKimiMoE(nn.Module):
                 activation_situ_beta=activation_situ_beta,
                 activation_situ_linear_beta=activation_situ_linear_beta,
             )
+            if (
+                config.hidden_act == "situ"
+                and activation_situ_linear_beta is not None
+                and get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP)
+            ):
+                self.shared_experts.act_fn = AscendSharedSparseSituAndMul(
+                    self.shared_experts.act_fn.beta,
+                    self.shared_experts.act_fn.linear_beta,
+                )
         else:
             self.shared_experts = None
 
@@ -397,7 +414,10 @@ class AscendKimiMoE(nn.Module):
         self.routed_expert_up_proj: ReplicatedLinear | None
         self.routed_output_transform: KimiRoutedOutputTransform | None
         if self.use_latent_moe:
-            self.routed_expert_down_proj = AscendKimiK3RoutedLinear(
+            # Match recipes: use Quant Matmul in both warmup and graph capture.
+            # Ordinary ReplicatedLinear keeps the logical weight [K, N] before
+            # the configured NZ conversion, without a singleton GMM dimension.
+            self.routed_expert_down_proj = ReplicatedLinear(
                 hidden_size,
                 self.moe_hidden_size,
                 bias=False,
@@ -407,7 +427,7 @@ class AscendKimiMoE(nn.Module):
             self.routed_expert_norm = (
                 RMSNorm(self.moe_hidden_size, eps=config.rms_norm_eps) if self.latent_moe_use_norm else None
             )
-            self.routed_expert_up_proj = AscendKimiK3RoutedLinear(
+            self.routed_expert_up_proj = ReplicatedLinear(
                 self.moe_hidden_size,
                 hidden_size,
                 bias=False,
@@ -449,6 +469,21 @@ class AscendKimiMoE(nn.Module):
             num_redundant_experts=num_redundant_experts,
         )
 
+        # Keep routing and stream decisions inside the runtime MoE op. The
+        # gate remains registered only here for checkpoint compatibility.
+        object.__setattr__(self.experts, "_kimi_gate", self.gate)
+        object.__setattr__(
+            self.experts,
+            "_kimi_router_stream",
+            torch.npu.Stream() if get_ascend_config().multistream_overlap_shared_expert else None,
+        )
+        if self.shared_experts is not None and get_ascend_config().multistream_overlap_shared_expert:
+            # Share a communication stream across this model's MoE layers;
+            # keep it separate from both Router and shared Cube/Vector work.
+            if not hasattr(vllm_config, "_kimi_shared_comm_stream"):
+                vllm_config._kimi_shared_comm_stream = torch.npu.Stream()
+            object.__setattr__(self.experts, "_kimi_shared_comm_stream", vllm_config._kimi_shared_comm_stream)
+
         # Use the factory's validated counts, including its effective EP size.
         moe_config = self.experts.moe_config
         self.n_routed_experts = num_experts
@@ -460,10 +495,9 @@ class AscendKimiMoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
-            router_logits=router_logits,
+            router_logits=hidden_states,
         )
         return final_hidden_states.view(num_tokens, hidden_size)
 
@@ -841,6 +875,7 @@ class AscendKimiDecoderLayer(UpstreamKimiDecoderLayer):
         return hidden_states, block_residual
 
 
+@support_torch_compile
 class AscendKimiLinearModel(UpstreamKimiLinearModel):
     """Kimi text model assembled from the Ascend decoder layer."""
 

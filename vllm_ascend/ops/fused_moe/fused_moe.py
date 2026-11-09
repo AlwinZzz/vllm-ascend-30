@@ -257,8 +257,8 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         """Mirror of upstream ``MoERunner.forward`` (this class is instantiated
         through the OOT PluggableLayer dispatch of ``MoERunner``).
 
-        Latent W4A8 SP shared experts use a plain tensor Add after the
-        routed-output transform. Other paths retain the foreach combine.
+        Shared and routed experts use a plain tensor Add after the
+        routed-output transform, independently of the shared scheduling policy.
         The runtime-aware reduction hooks (#16550) are unchanged.
         """
         # Apply transform for routed experts (e.g., latent projection for
@@ -341,10 +341,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # Shared join and final residual Add are outside named MoE fusion.
         with moe_superkernel_scope(None, getattr(self, "_kimi_superkernel_active", False)):
             if shared_output is not None:
-                if getattr(self, "_release_shared_schedule", False):
-                    result = shared_output + fused_output
-                else:
-                    result = torch._foreach_add([shared_output], [fused_output])[0]
+                result = shared_output + fused_output
             else:
                 result = fused_output
 

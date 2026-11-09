@@ -255,7 +255,8 @@ class TestKimiMoESuperkernel(unittest.TestCase):
         load("vllm_ascend/ops/fused_moe/fused_moe.py", {"_ascend_kimi_moe"}, ns)
         load("vllm_ascend/ops/fused_moe/fused_moe.py", {"_forward_standard"}, ns, "AscendMoERunner")
         runner._forward_standard = lambda *args: ns["_forward_standard"](runner, *args)
-        with patch.object(torch, "_foreach_add", side_effect=lambda a, b: record("add", [a[0] + b[0]])):
+        tensor_add = torch.Tensor.__add__
+        with patch.object(torch.Tensor, "__add__", lambda a, b: record("add", tensor_add(a, b))):
             result = ns["_ascend_kimi_moe"](x, None, "layer")
         torch.testing.assert_close(result, x * 3)
         self.assertEqual(observed, {"front": "layer_1.moe", "experts": "layer_1.moe", "up": "layer_1.moe", "add": None})

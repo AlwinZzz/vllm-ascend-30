@@ -15,8 +15,6 @@ This section is for developers who want to contribute to vLLM Ascend or understa
 
 Explore the design documents covering patch architecture, CPU binding, model runner internals, disaggregated prefill, EPLB, ACL Graph, KV Cache Pool, custom operators, context parallel, quantization, and NPUGraph.
 
-- [Kimi FlashKDA prefill V2 integration (Chinese)](kimi_prefill_fused_kda_zh.md)
-
 ## Evaluation
 
 - **[Using EvalScope](evaluation/using_evalscope.md)** — Model evaluation with EvalScope

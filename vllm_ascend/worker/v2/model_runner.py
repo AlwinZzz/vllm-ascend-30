@@ -505,7 +505,6 @@ class NPUModelRunner(GPUModelRunner):
             self.vllm_config.compilation_config.static_forward_context,
             self.vllm_config.scheduler_config.max_num_seqs,
         )
-
         copy_mamba_state = getattr(self.model_state, "copy_state_after_kv_load", None)
         if (
             callable(copy_mamba_state)
@@ -747,6 +746,13 @@ class NPUModelRunner(GPUModelRunner):
                 with disable_compilation(self.get_model()):
                     self._dummy_run(mc2_tokens_capacity, skip_attn=True, skip_eplb=True, is_profile=True)
             super().profile_run()
+        # Release the PD-decode ND KDA projections only after the profile
+        # forward, so the measured peak activation keeps its conservative
+        # (weights-resident) baseline. The worker subtracts the stashed byte
+        # count from the weights accounting before sizing the KV cache pool.
+        from vllm_ascend.ops.kimi_kda import release_mega_kda_nd_weights
+
+        self.mega_kda_nd_released_bytes = release_mega_kda_nd_weights(self.model)
 
     def gather_batch_req_state(self, scheduler_output: SchedulerOutput, dummy_run: bool):
         batch_state, uniform_token_count = super().gather_batch_req_state(scheduler_output, dummy_run)

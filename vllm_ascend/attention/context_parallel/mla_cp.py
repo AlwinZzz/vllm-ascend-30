@@ -266,19 +266,21 @@ class AscendMlaDCPMetadataBuilder(
             dtype=torch.int32,
         )
         seq_tot = padded_local_chunk_seq_lens.sum(dim=1).tolist()
+        local_chunk_starts_cpu = local_chunk_starts.pin_memory()
+        padded_local_chunk_seq_lens_cpu = padded_local_chunk_seq_lens.pin_memory()
         return DCPChunkedContextMetadata(
             cu_seq_lens=chunked_context_metadata.cu_seq_lens,
-            starts=local_chunk_starts.pin_memory().to(self.device, non_blocking=True),
+            starts=local_chunk_starts_cpu.to(self.device, non_blocking=True),
             seq_tot=seq_tot,
             max_seq_lens=chunked_context_metadata.max_seq_lens,
             chunk_seq_lens=self.chunk_seq_lens,
             chunk_seq_lens_npu=chunked_context_metadata.chunk_seq_lens_npu,
             chunk_actual_seq_lengths_kv_list=chunked_context_metadata.chunk_actual_seq_lengths_kv_list,
             workspace=chunked_context_metadata.workspace,
-            padded_chunk_seq_lens_npu=padded_local_chunk_seq_lens.to(self.device, non_blocking=True),
+            padded_chunk_seq_lens_npu=padded_local_chunk_seq_lens_cpu.to(self.device, non_blocking=True),
             padded_local_chunk_seq_lens=padded_local_chunk_seq_lens.tolist(),
             local_context_lens_allranks=local_context_lens_allranks.tolist(),
-            padded_local_cu_seq_lens=padded_local_cu_chunk_seq_lens_cpu.pin_memory().to(
+            padded_local_cu_seq_lens=padded_local_cu_chunk_seq_lens_cpu.to(
                 self.device,
                 non_blocking=True,
             ),
@@ -288,6 +290,8 @@ class AscendMlaDCPMetadataBuilder(
             pcp_global_req_indices=local_rows,
             pcp_global_block_table=block_table,
             kv_rank_offsets=[[rank * toks for rank in self.dcp_collective_rank_order] for toks in seq_tot],
+            cpu_copy_sources=chunked_context_metadata.cpu_copy_sources
+            + (local_chunk_starts_cpu, padded_local_chunk_seq_lens_cpu, padded_local_cu_chunk_seq_lens_cpu),
         )
 
     def build_decode_metadata(

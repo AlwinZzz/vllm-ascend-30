@@ -267,6 +267,33 @@ def test_non_dcp_uses_per_request_length_bounds(monkeypatch, kind, architecture,
     assert torch.equal(spec.target_input_buffers.seq_lens_cpu, original_target)
 
 
+@pytest.mark.parametrize("full_rebuild", [False, True])
+@pytest.mark.parametrize("num_rejected", [0, 1, 7])
+def test_non_dcp_dspark_metadata_ignores_optimistic_target_snapshot(monkeypatch, full_rebuild, num_rejected):
+    width, padded = 8, 4
+    spec, _, _ = _speculator(monkeypatch, "dspark", "MLA", width, padded, width, use_dcp=False)
+    assert spec.requires_target_cpu_seq_lens is False
+    # The target no longer publishes a rejection-corrected CPU snapshot.
+    # FIA must use the draft's own exact lengths, even when target bounds
+    # contain rejected/lookahead tokens and differ across requests.
+    spec.target_input_buffers.seq_lens_cpu[:2] = torch.tensor([40, 128])
+    spec.input_buffers.seq_lens[:2] = torch.tensor([40 - num_rejected, 128 - num_rejected])
+    if full_rebuild:
+        result = spec.build_draft_attn_metadatas(padded, spec.input_batch.seq_lens_cpu_upper_bound)[0]
+    else:
+        result = spec._build_attn_metadata(
+            num_reqs=2,
+            batch_desc=BatchExecutionDescriptor(cg_mode=CUDAGraphMode.NONE, num_tokens=2 * width, num_reqs=padded),
+            query_start_loc_np=np.arange(padded + 1, dtype=np.int32) * width,
+            seq_lens_cpu_upper_bound=spec.input_batch.seq_lens_cpu_upper_bound,
+            step=width,
+            causal=spec._group_causal,
+        )
+    common = result["draft.layer"].common
+    assert common.seq_lens_cpu[:2].tolist() == [40 - num_rejected, 128 - num_rejected]
+    assert spec.target_input_buffers.seq_lens_cpu[:2].tolist() == [40, 128]
+
+
 def test_sfa_consumer_uses_device_local_lengths_and_ignores_cpu(monkeypatch):
     builder = object.__new__(AscendSFADCPMetadataBuilder)
     builder.device = torch.device("cpu")  # Device stand-in; no NPU kernels run.

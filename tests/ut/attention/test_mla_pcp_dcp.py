@@ -339,6 +339,67 @@ def chunk_metadata_on_cpu(monkeypatch):
     monkeypatch.setattr(torch, "zeros", zeros_without_pinning)
 
 
+def test_chunk_metadata_uploads_are_pinned_async_and_own_each_steps_sources(monkeypatch):
+    from vllm_ascend.attention.mla_v1 import AscendMLAMetadataBuilder
+
+    cpu_zeros = torch.zeros
+    pending = []
+
+    def pinned_zeros(*args, **kwargs):
+        pinned = kwargs.pop("pin_memory", False)
+        result = cpu_zeros(*args, **kwargs)
+        result._test_pinned = pinned
+        return result
+
+    def pin(tensor):
+        result = tensor.clone()
+        result._test_pinned = True
+        return result
+
+    def enqueue_copy(source, device, *, non_blocking=False):
+        assert source._test_pinned, "pageable staging may block the submission thread"
+        assert non_blocking, "metadata upload must not wait for device completion"
+        destination = torch.empty_like(source)
+        pending.append((source, destination))
+        return destination
+
+    def blocking_npu_copy(*args, **kwargs):
+        raise AssertionError("blocking metadata .npu() upload")
+
+    monkeypatch.setattr(torch, "zeros", pinned_zeros)
+    monkeypatch.setattr(torch.Tensor, "pin_memory", pin)
+    monkeypatch.setattr(torch.Tensor, "to", enqueue_copy)
+    monkeypatch.setattr(torch.Tensor, "npu", blocking_npu_copy, raising=False)
+
+    builder = AscendMLAMetadataBuilder.__new__(AscendMLAMetadataBuilder)
+    builder.chunked_prefill_enabled = True
+    builder.num_decodes = 0
+    builder.num_prefills = 2
+    builder.chunked_prefill_workspace_size = 256
+    builder.chunk_alignment = 128
+    builder.chunked_prefill_workspace = torch.empty(0)
+    builder.device = torch.device("cpu")
+    builder.query_lens = torch.tensor([64, 64], dtype=torch.int32)
+    builder.seq_lens = torch.tensor([576, 320], dtype=torch.int32)
+
+    first = builder.build_chunked_metadata(0, SimpleNamespace(num_reqs=2))
+    first_values = [source.clone() for source in first.cpu_copy_sources]
+    builder.seq_lens = torch.tensor([192, 192], dtype=torch.int32)
+    second = builder.build_chunked_metadata(0, SimpleNamespace(num_reqs=2))
+
+    assert len(pending) == 6
+    for previous, current, expected in zip(first.cpu_copy_sources, second.cpu_copy_sources, first_values):
+        assert previous.data_ptr() != current.data_ptr()
+        torch.testing.assert_close(previous, expected)
+    # Complete both steps' copies only after the next CPU build. The first
+    # step must still see its own offsets and lengths, with no event wait.
+    for source, destination in pending:
+        destination.copy_(source)
+    assert first.chunk_seq_lens_npu.tolist() == [[128, 128], [128, 128], [128, 0], [128, 0]]
+    assert second.chunk_seq_lens_npu.tolist() == [[128, 128]]
+    assert first.cu_seq_lens.tolist() == [[0, 128, 256], [0, 128, 256], [0, 128, 128], [0, 128, 128]]
+
+
 def _chunk_config(*, block_size=128, pcp_size=1, dcp_size=2, interleave=1, max_num_seqs=16):
     return SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=32768),

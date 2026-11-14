@@ -260,6 +260,17 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
                 self.vllm_config.cache_config.block_size
             )
 
+    @property
+    def requires_target_cpu_seq_lens(self) -> bool:
+        """Whether drafting consumes the target's exact CPU length snapshot.
+
+        Non-DCP MLA/FIA reads its own rejection-corrected draft lengths in
+        _prepare_draft_dcp_metadata_inputs. FlashMLA also owns device lengths,
+        including DCP. Only the DCP fallback derives its lengths from
+        target_input_buffers.seq_lens_cpu. Keep unaudited backends conservative.
+        """
+        return self.attn_architecture != "MLA" or (self.use_dcp and not self._draft_mla_uses_device_lengths)
+
     def _prepare_draft_dcp_metadata_inputs(
         self, num_reqs: int, num_reqs_padded: int, step: int
     ) -> tuple[torch.Tensor | None, torch.Tensor]:

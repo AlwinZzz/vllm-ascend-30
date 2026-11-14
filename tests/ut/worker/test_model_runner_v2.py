@@ -27,6 +27,7 @@ from vllm_ascend.attention.mla_v1 import AscendMLAImpl
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
+from vllm_ascend.worker.v2.spec_decode.dspark.speculator import AscendDSparkSpeculator
 from vllm_ascend.worker.v2.utils import C8KVBlockZeroer
 
 
@@ -1580,10 +1581,50 @@ def test_prepare_inputs_covers_draft_full_dcp_pp_and_rswa():
     runner, scheduler_output, batch_req_state, batch_desc = _prepare_inputs_runner(
         draft=True, full_cg=True, use_dcp=True, use_pp=True, rswa=True, speculator=True
     )
+    batch_req_state.is_prefilling_np[:] = False
     out, partitioned = _run_prepare_inputs(runner, scheduler_output, batch_req_state, batch_desc)
     assert out is partitioned
     runner.num_computed_tokens_event.synchronize.assert_called_once_with()
     assert runner.req_states.num_computed_tokens_cpu[0] == 3
+
+
+@pytest.mark.parametrize("new_requests", [False, True])
+def test_prepare_inputs_prefill_does_not_wait_for_previous_decode_snapshot(new_requests):
+    runner, output, batch, desc = _prepare_inputs_runner(speculator=True)
+    output.scheduled_cached_reqs.req_ids = [] if new_requests else batch.req_ids
+    # An in-flight snapshot can belong to a previous batch or slot occupant.
+    runner.num_computed_tokens_cpu.fill_(-999)
+    runner.num_computed_tokens_event.synchronize.side_effect = AssertionError("prefill waited on device")
+    host_counts = runner.req_states.num_computed_tokens_cpu.clone()
+
+    _run_prepare_inputs(runner, output, batch, desc)
+
+    runner.num_computed_tokens_event.synchronize.assert_not_called()
+    torch.testing.assert_close(runner.req_states.num_computed_tokens_cpu, host_counts)
+    assert runner.input_buffers.seq_lens_cpu[:2].tolist() == [3, 4]
+
+
+def test_mixed_batch_refreshes_only_cached_decode_lengths():
+    runner, output, batch, _ = _prepare_inputs_runner(speculator=True)
+    output.scheduled_cached_reqs.req_ids = ["r0", "r1", "not_scheduled"]
+    runner.num_computed_tokens_cpu[:2] = torch.tensor([31, 6], dtype=torch.int32)
+    # r0 is still consuming its prompt; r1 has rejected speculative tokens.
+    runner.req_states.num_computed_tokens_cpu[:2] = torch.tensor([16, 9], dtype=torch.int32)
+    runner._update_seq_lens_cpu(output, batch.req_ids, np.array([True, False]))
+
+    runner.num_computed_tokens_event.synchronize.assert_called_once_with()
+    assert runner.req_states.num_computed_tokens_cpu[:2].tolist() == [16, 6]
+    assert runner.input_buffers.seq_lens_cpu[:2].tolist() == [18, 8]
+
+
+def test_new_decode_request_keeps_initialized_prefix_length_without_snapshot():
+    runner, output, batch, _ = _prepare_inputs_runner(speculator=True)
+    output.scheduled_cached_reqs.req_ids = []
+    runner.num_computed_tokens_cpu.fill_(-999)
+    runner._update_seq_lens_cpu(output, batch.req_ids, np.array([False, False]))
+
+    runner.num_computed_tokens_event.synchronize.assert_not_called()
+    assert runner.input_buffers.seq_lens_cpu[:2].tolist() == [3, 4]
 
 
 def test_postprocess_sampled_copies_only_with_speculator():
@@ -1886,6 +1927,37 @@ def test_flashmla_cpu_length_sync_bypass_does_not_copy_or_record_event():
     current_stream.assert_not_called()
     runner.num_computed_tokens_cpu.copy_.assert_not_called()
     runner.num_computed_tokens_event.record.assert_not_called()
+
+
+@pytest.mark.parametrize("dcp_size", [1, 8])
+@pytest.mark.parametrize("draft_device_lengths", [False, True])
+@pytest.mark.parametrize("target_flashmla", [False, True])
+def test_target_snapshot_bypass_follows_actual_dspark_cpu_consumer(dcp_size, draft_device_lengths, target_flashmla):
+    runner = _make_runner()
+    runner.model_config.architecture = "KimiK3ForCausalLM"
+    runner.model = torch.nn.Module()
+    runner.vllm_config.parallel_config = SimpleNamespace(
+        pipeline_parallel_size=1, prefill_context_parallel_size=1, decode_context_parallel_size=dcp_size
+    )
+    runner.ascend_config.kvpp_config = SimpleNamespace(size=1)
+    runner.speculator = AscendDSparkSpeculator.__new__(AscendDSparkSpeculator)
+    runner.speculator.attn_architecture = "MLA"
+    runner.speculator.use_dcp = dcp_size > 1
+    runner.speculator._draft_mla_uses_device_lengths = draft_device_lengths
+
+    with patch("vllm_ascend.worker.v2.model_runner.all_mla_use_flashmla", return_value=target_flashmla):
+        assert runner._can_skip_spec_cpu_length_sync() is (target_flashmla and (draft_device_lengths or dcp_size == 1))
+
+
+def test_device_length_postprocess_does_not_call_snapshot_helper():
+    runner = _make_runner()
+    runner.speculator = object()
+    runner._skip_spec_cpu_length_sync = True
+    runner._copy_num_computed_tokens_to_cpu = Mock(side_effect=AssertionError("unnecessary target snapshot"))
+    with patch.object(GPUModelRunner, "postprocess_sampled") as sampled:
+        runner.postprocess_sampled("indices", "tokens", "accepted", "rejected")
+    sampled.assert_called_once_with("indices", "tokens", "accepted", "rejected", None)
+    runner._copy_num_computed_tokens_to_cpu.assert_not_called()
 
 
 def test_flashmla_cpu_lengths_keep_upper_bounds_without_event_wait():

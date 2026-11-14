@@ -176,6 +176,9 @@ class ChunkedContextMetadata:
     chunk_seq_lens: torch.Tensor
     chunk_seq_lens_npu: torch.Tensor
     chunk_actual_seq_lengths_kv_list: list[list[int]]
+    # Own immutable staging tensors until metadata is retired. Each build uses
+    # new storage, so a later CPU build cannot overwrite an in-flight H2D.
+    cpu_copy_sources: tuple[torch.Tensor, ...] = ()
 
 
 @dataclass
@@ -749,15 +752,18 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         chunk_actual_seq_lengths_kv_list = [
             torch.cumsum(self.chunk_seq_lens[i], dim=0).tolist() for i in range(self.num_chunks)
         ]
+        chunk_starts_cpu = chunk_starts.pin_memory()
+        chunk_seq_lens_cpu = self.chunk_seq_lens.pin_memory()
         return ChunkedContextMetadata(
-            cu_seq_lens=self.cu_seq_lens_cpu.pin_memory().to(self.device, non_blocking=True),
-            starts=chunk_starts.pin_memory().to(self.device, non_blocking=True),
+            cu_seq_lens=self.cu_seq_lens_cpu.to(self.device, non_blocking=True),
+            starts=chunk_starts_cpu.to(self.device, non_blocking=True),
             seq_tot=self.chunk_seq_lens.sum(dim=1).tolist(),
             max_seq_lens=self.chunk_seq_lens.max(dim=1).values.tolist(),
             chunk_seq_lens=self.chunk_seq_lens,
-            chunk_seq_lens_npu=self.chunk_seq_lens.npu(),
+            chunk_seq_lens_npu=chunk_seq_lens_cpu.to(self.device, non_blocking=True),
             workspace=self.chunked_prefill_workspace,
             chunk_actual_seq_lengths_kv_list=chunk_actual_seq_lengths_kv_list,
+            cpu_copy_sources=(self.cu_seq_lens_cpu, chunk_starts_cpu, chunk_seq_lens_cpu),
         )
 
     def get_block_table_size(self, common_attn_metadata: AscendCommonAttentionMetadata, build_metadata_step: int):

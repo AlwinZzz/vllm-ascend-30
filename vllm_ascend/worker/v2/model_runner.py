@@ -536,6 +536,13 @@ class NPUModelRunner(GPUModelRunner):
         self.model_state.kvpp_runtime = self.kvpp
         self._skip_spec_cpu_length_sync = self._can_skip_spec_cpu_length_sync()
         logger.info("Speculative CPU length synchronization bypass enabled: %s", self._skip_spec_cpu_length_sync)
+        if self.speculator is not None:
+            logger.info(
+                "Draft length consumers: requires_target_cpu_seq_lens=%s, uses_device_lengths=%s, dcp=%s",
+                getattr(self.speculator, "requires_target_cpu_seq_lens", "unknown"),
+                getattr(self.speculator, "_draft_mla_uses_device_lengths", False),
+                getattr(self.speculator, "use_dcp", "unknown"),
+            )
 
         self._fill_c8_mxfp_v_scale_caches()
 
@@ -816,7 +823,7 @@ class NPUModelRunner(GPUModelRunner):
 
         req_ids = batch_req_state.req_ids
 
-        self._update_seq_lens_cpu(scheduler_output, req_ids)
+        self._update_seq_lens_cpu(scheduler_output, req_ids, batch_req_state.is_prefilling_np)
 
         num_scheduled_tokens_np = batch_req_state.num_scheduled_tokens
         idx_mapping_np = batch_req_state.idx_mapping_np
@@ -1232,12 +1239,20 @@ class NPUModelRunner(GPUModelRunner):
         return output
 
     def _can_skip_spec_cpu_length_sync(self) -> bool:
-        """Use device lengths for K3/DSpark FlashMLA, including DCP."""
+        """Skip the target snapshot only when no audited consumer needs it."""
         parallel = self.vllm_config.parallel_config
         if (
             self.model_config.architecture
             not in {"KimiLinearForCausalLM", "KimiK3ForCausalLM", "KimiK3ForConditionalGeneration"}
-            or not getattr(self.speculator, "_draft_mla_uses_device_lengths", False)
+            # DSpark non-DCP MLA/FIA reads its own exact draft lengths, so it
+            # must not force an independent target D2H. Older device-length
+            # speculators retain their existing opt-in; unknown consumers wait.
+            or getattr(
+                self.speculator,
+                "requires_target_cpu_seq_lens",
+                not getattr(self.speculator, "_draft_mla_uses_device_lengths", False),
+            )
+            is not False
             # PP/PCP and offload paths have not been audited for host readers.
             or parallel.pipeline_parallel_size != 1
             or parallel.prefill_context_parallel_size != 1
@@ -1247,8 +1262,9 @@ class NPUModelRunner(GPUModelRunner):
         ):
             return False
 
-        # FlashMLA derives DCP-local lengths from rejection-corrected device
-        # counters. K3's non-MLA attention uses the KDA device-length path.
+        # Target FlashMLA derives DCP-local lengths from rejection-corrected
+        # device counters. K3's KDA layers also use device lengths. Target FIA
+        # still needs this snapshot regardless of the draft's capability.
         return all_mla_use_flashmla(self.model)
 
     def postprocess_sampled(
@@ -1278,18 +1294,19 @@ class NPUModelRunner(GPUModelRunner):
             query_start_loc,
         )
 
-        # The copy helper skips D2H only when both target and draft
-        # backends are on the audited device-length path.
+        # Drafts with independent exact lengths do not require a target CPU
+        # snapshot. Keep the parent's NPU rejection updates above in all cases.
         # Non-last PP stages receive rejections without owning a speculator.
         if (
-            self.speculator is not None and not is_deepseek_v41(self.model_config.hf_config)
-        ) or self.sync_spec_pp_cpu_counts:
+            (self.speculator is not None and not is_deepseek_v41(self.model_config.hf_config))
+            or self.sync_spec_pp_cpu_counts
+        ) and not self._skip_spec_cpu_length_sync:
             self._copy_num_computed_tokens_to_cpu()
 
     def postprocess_num_computed_tokens(self, input_batch: AscendInputBatch) -> None:
         super().postprocess_num_computed_tokens(input_batch)
         # Unsampled prefill chunks must also refresh the next step's snapshot.
-        if self.sync_spec_pp_cpu_counts:
+        if self.sync_spec_pp_cpu_counts and not self._skip_spec_cpu_length_sync:
             self._copy_num_computed_tokens_to_cpu()
 
     def _copy_num_computed_tokens_to_cpu(self):
@@ -1313,6 +1330,7 @@ class NPUModelRunner(GPUModelRunner):
         self,
         scheduler_output: SchedulerOutput,
         req_ids: list[str],
+        is_prefilling: np.ndarray | None = None,
     ):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
 
@@ -1322,11 +1340,30 @@ class NPUModelRunner(GPUModelRunner):
             (self.speculator is not None and not is_deepseek_v41(self.model_config.hf_config))
             or self.sync_spec_pp_cpu_counts
         ):
-            # Blocks CPU submission until D2H completes; may stall the async pipeline.
-            self.num_computed_tokens_event.synchronize()
-            for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
-                req_index = self.req_states.req_id_to_index[req_id]
-                self.req_states.num_computed_tokens_cpu[req_index] = self.num_computed_tokens_cpu[req_index]
+            # Only continuing decode requests can carry rejection-corrected
+            # counts. New requests and prompt chunks already have exact
+            # scheduler-owned CPU counts. A pure prefill step must not wait
+            # for unrelated requests in the previous D2H snapshot.
+            # Without phase information, retain the conservative call contract.
+            # PD tail recompute is classified as decode before this call.
+            cached_req_ids = set(scheduler_output.scheduled_cached_reqs.req_ids)
+            req_ids_needing_snapshot = [
+                req_id
+                for i, req_id in enumerate(req_ids)
+                if req_id in cached_req_ids
+                and (
+                    is_prefilling is None
+                    or not is_prefilling[i]
+                    or scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+                )
+            ]
+            if req_ids_needing_snapshot:
+                # FIA/PCP decode still needs exact host counts until its
+                # attention backend can consume rejection-corrected NPU lengths.
+                self.num_computed_tokens_event.synchronize()
+                for req_id in req_ids_needing_snapshot:
+                    req_index = self.req_states.req_id_to_index[req_id]
+                    self.req_states.num_computed_tokens_cpu[req_index] = self.num_computed_tokens_cpu[req_index]
 
         # Without a CPU consumer, retain the upstream optimistic upper bound.
         # prepare_pos_seq_lens still reads exact rejection-corrected NPU state.

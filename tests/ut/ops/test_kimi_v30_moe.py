@@ -312,6 +312,30 @@ class TestDecodeDependencies(unittest.TestCase):
         self.assertEqual(limits, [("shared", (16, 32) if quantized else (32, 1))])
 
 
+class TestRouterStreamReuse(unittest.TestCase):
+    def test_router_stream_is_reused_per_model_and_respects_multistream(self):
+        config = NS()
+        other_config = NS()
+        options = NS(multistream_overlap_shared_expert=True)
+        factory = Mock(side_effect=[object(), object()])
+        ns = dict(torch=NS(npu=NS(Stream=factory)), get_ascend_config=lambda: options)
+        load("vllm_ascend/models/kimi_k3.py", {"_get_kimi_router_stream"}, ns)
+        get_stream = ns["_get_kimi_router_stream"]
+        first = get_stream(config)
+        self.assertIs(get_stream(config), first)
+        self.assertIsNot(get_stream(other_config), first)
+        self.assertEqual(factory.call_count, 2)
+        options.multistream_overlap_shared_expert = False
+        self.assertIsNone(get_stream(config))
+        empty_config = NS()
+        self.assertIsNone(get_stream(empty_config))
+        self.assertFalse(hasattr(empty_config, "_kimi_router_stream"))
+        self.assertEqual(factory.call_count, 2)
+        options.multistream_overlap_shared_expert = True
+        self.assertIs(get_stream(config), first)
+        self.assertEqual(factory.call_count, 2)
+
+
 class TestRuntimeMoEBoundary(unittest.TestCase):
     def test_latent_transform_once_and_layer_cursor_once(self):
         ns = dict(torch=torch, _unpack=lambda value: value, _resolve_layer_name=lambda name: name)

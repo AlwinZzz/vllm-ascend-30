@@ -84,7 +84,10 @@ these scopes. Other models retain their generic 0.30 policy.
 
 Named scopes cover Router/latent down through routed Combine and latent
 norm/up. Nested exclusions keep shared AllGather, shared ReduceScatter, the
-final join and Add outside fusion. The owning ACL graph is optimized once
+final join and Add outside fusion. MoE layers sharing one model
+configuration reuse one Router stream, matching the recipes model context.
+Disabling shared multistream creates no Router stream. The owning ACL
+graph is optimized once
 after successful capture with `dcci_disable_on_kernel=[".*"]` and
 `auto_op_parallel=1`; replay never repeats optimization. Capture tracking is
 local to the forward context for V1 and to the owning `UpdatableGraph` capture
@@ -217,10 +220,11 @@ considered so capture cannot accidentally select MegaMoE.
 | Active workload in the communication domain | Kimi MoE | ACLGraph |
 | --- | --- | --- |
 | Pure prefill + idle dummy | MegaMoE if otherwise supported | NONE on all peers |
-| Prefill + real Decode, or a local mixed batch | Ordinary MoE | NONE on all peers |
+| Prefill + real Decode, or a local mixed batch | Ordinary MoE | NONE on v1; existing V2 policy |
 | Pure Decode + idle dummy | Ordinary MoE | Common supported graph mode |
 | Decode graph capture | Ordinary MoE | Requested capture mode |
-| MRv2 or KV consumer | Ordinary MoE | Existing runner policy |
+| MRv2 coordinated pure prefill + idle dummy | MegaMoE if otherwise supported | NONE on all peers |
+| MRv2 uncoordinated/draft forward, or consumer-only instance | Ordinary MoE | Existing runner policy |
 
 A prefill is detected from computed versus prompt tokens, not from token
 count alone. One-token/chunked prefill therefore cannot accidentally reuse a
@@ -231,7 +235,118 @@ Keep 0.30's uniform input padding when its selected backend or fine-grained
 TP requires it. Unlike the old PR20 code, 0.30 already preserves the agreed
 `num_tokens_across_dp` vector inside dummy execution; this fix is retained.
 The policy assumes matching configuration across participating ranks.
+
+V1 and V2 both report Kimi eligibility and backend selection at INFO level.
+V1 emits `Kimi V1 MegaMoE config` from backend selection; V2 emits
+`Kimi V2 MegaMoE config` after loading. Configuration messages are deduplicated
+per configuration in each worker process, while selection messages use the
+logger's default local-first-rank scope and are deduplicated by decision.
+The configuration includes actual layouts, activation, KV role, upstream EPLB
+and legacy Ascend dynamic EPLB/redundancy/mix-placement flags. Selection
+includes the agreed Decode flag, graph mode, capacity overflow and draft flag.
+
+PD colocation (`kv_both` or no KV transfer) does not itself exclude V1
+MegaMoE. Pure Prefill across the participating ranks may use it; real Decode
+or a Prefill/Decode mixture in that communication domain selects ordinary
+MoE. The separate `mix_placement` expert-placement feature and legacy Ascend
+dynamic EPLB/redundancy remain excluded by the shared weight guard. Upstream
+`--enable-eplb` is accepted only with V2 by platform validation; the V2 EPLB
+support below does not enable that flag on V1.
+
+MRv2 scopes target phase metadata to `execute_model` and records real request
+stages in `gather_batch_req_state`. Its existing dispatch patch exchanges
+real-work, Decode, profiling, eligibility and capacity metadata in one extra
+CPU-group all-reduce before upstream graph/DP coordination. This collective
+also runs on idle peers; it cannot be conditional on local Prefill alone.
+Consumer-only instances retain their existing coordination without this extra
+collective. A `kv_both` instance can produce and consume KV; its actual batch
+phase determines eligibility. Pure Prefill can use MegaMoE, while Decode and
+mixed batches continue to use ordinary MoE.
+Supported pure Prefill forces eager execution and pads the runner descriptor
+and DP token vector to the same TP-aligned count. Real token counts remain
+separate for mask construction, KV metadata and sampling. Missing phase data,
+graph capture/replay and all-dummy non-profile runs cannot select MegaMoE.
+
+The first MRv2 integration falls back to ordinary MoE for PCP, microbatching
+and cross-DP o_proj/MLP TP that requires graph execution. DCP alone keeps the
+same query-token layout and does not trigger this fallback. Existing weight,
+activation, LoRA, EPLB and capacity checks still apply. Explicit profile runs
+warm MegaMoE before KV cache sizing, including the extra capacity-sized dummy
+when the scheduler token limit exceeds the MegaMoE limit. Explicit CPP
+Prefill timing dummies use the same backend; unrelated graph warmups remain
+ordinary MoE. Real forwards clear padded input IDs and positions so a previous
+batch cannot supply stale input values to the new physical rows.
+
+A5 MegaMoE requires `x_active_mask=None`. Although the runner preserves valid
+token metadata, padded and idle rows still participate in the fused operator.
+Their outputs are discarded, but their routes consume receive-buffer capacity.
+Tune `mega_moe_max_tokens` using the physical padded workload and expert-load
+skew; a valid-token mask does not prevent A5 receive overflow.
+
+The dependency-free regression suite is
+`python3 tests/ut/worker/test_kimi_megamoe_v2.py`. On A5, additionally run the
+existing operator integration with
+`torchrun --nproc_per_node=8 tests/e2e/nightly/single_node/ops/test_mega_moe.py --tokens 1 32 256 --v2-prefill`.
+This covers real CPU collectives, unequal scheduled counts, an idle peer and
+the padded MegaMoE numerical reference; complete model accuracy, PP/DCP,
+long-running request transitions and latency still require deployment tests.
 Independent P and D instances make decisions in their own communication domains.
+
+MRv2's upstream `--enable-eplb` supports redundant expert slots with this
+Prefill backend. For 224 logical experts, eight redundant experts and EP8,
+the physical capacity is 232 experts, or 29 per rank. The existing router
+maps logical TopK IDs to physical IDs before dispatch; the communicator uses
+physical capacity, and the returned per-expert token counts feed V2's existing
+load recorder. MegaMoE reuses the weight lists registered for EPLB migration
+and views their byte scales as E8M0 without copying storage. Ordinary Decode
+continues to use transposed views of those same live lists. Legacy Ascend
+dynamic EPLB and mix placement retain their existing fallback.
+
+The CPU regressions check selection with `kv_producer`, DP1, TP8/EP8 and
+eight redundant experts, plus storage sharing across simulated in-place
+weight migration. On A5, test the 29-expert weight-list contract with
+`torchrun --nproc_per_node=8 tests/e2e/nightly/single_node/ops/test_mega_moe.py --experts 232 --tokens 1 32 256 --v2-prefill --eplb`.
+This operator case does not run the asynchronous EPLB controller. Real-model
+validation must retain `--enable-eplb --eplb-config.num_redundant_experts 8`
+and run beyond the configured `step_interval` until a cycle commits, then
+check accuracy, mappings, local load counts and Prefill/Decode transitions.
+
+The multimodal K3 wrapper constructs its language model through
+`init_vllm_registered_model`, which deep-copies `model_config` in
+`with_hf_config`. Routed-layer quantization records belong to that inner
+configuration. The wrapper propagates those records to the outer configuration
+before weight processing, so the V2 runner can validate the loaded layouts.
+Without this propagation, even a pure Prefill batch on a `kv_producer` sees
+unknown layouts and falls back to ordinary MoE. Mixed and unsupported layouts
+remain ineligible after propagation.
+
+To diagnose a missing MegaMoE call, inspect the `Kimi V2 MegaMoE config` INFO
+line emitted after model loading. It reports the normalized fused-MC2 setting,
+operator availability, hardware support, actual registered routed layouts,
+group size, EP/PCP sizes, KV role, upstream EPLB flag and redundant expert
+count. An internal `fused_mc2=1` is expected
+after the user's `enable_fused_mc2=2` is normalized. Kimi's A5 path requires
+`W4A8MXFP`; an ordinary INT4/INT8 `W4A8` checkpoint does not meet this layout
+contract and must not be enabled by relaxing the selector.
+The `capable` flag alone does not prove execution: unknown layouts may reserve
+capacity before loading, while runtime selection also requires supported
+weights and an agreed Prefill phase.
+
+The INFO phase decision distinguishes `ready`, `decode_or_unknown_phase`,
+`ineligible_rank` and `token_capacity_or_padding`. The separate
+`Kimi V2 MoE selection` line reports the chosen backend and forward-context
+phase/graph state. Set the existing `VLLM_LOGGING_LEVEL=DEBUG` before restarting
+workers for per-batch local/peer metadata, the graph-required eligibility flag,
+microbatching, PCP and aligned token counts. Filter worker output with:
+
+```bash
+rg 'Kimi V[12] MegaMoE|Kimi V[12] MoE selection' worker.log
+```
+
+The initial regression suite missed the `kv_both` producer/consumer combination:
+its Prefill was incorrectly excluded at context creation, phase agreement and
+backend selection. A regression now executes the runner hooks across Prefill
+and Decode on that role and verifies `FUSED_MC2` followed by ordinary `MC2`.
 
 ## Validation
 
@@ -289,7 +404,8 @@ regressions for the following fixes:
   simulates release, then checks Prefill/Decode/Prefill storage ownership.
 - Kimi MegaMoE execution requires registered W4A8 MXFP routed layouts,
   group size 32, supported activation and the existing EP limit (2–64), with
-  no mixed layouts, dynamic EPLB, redundant experts or mix placement. These
+  no mixed layouts, legacy dynamic EPLB or mix placement. Redundant experts
+  are supported with MRv2's upstream EPLB and remain excluded otherwise. These
   constraints also govern weight preparation. Layouts are recorded as an
   immutable set on the owning model config, without a global registry.
 - Before weights exist, startup still reserves 0.30's configured prefill

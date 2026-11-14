@@ -241,8 +241,8 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
             if _EXTRA_CTX.use_mega_moe:
                 w1 = layer.w13_weight_list
                 w2 = layer.w2_weight_list
-                w1_scale = layer.w13_weight_scale_list
-                w2_scale = layer.w2_weight_scale_list
+                w1_scale = [scale.view(torch.float8_e8m0fnu) for scale in layer.w13_weight_scale_list]
+                w2_scale = [scale.view(torch.float8_e8m0fnu) for scale in layer.w2_weight_scale_list]
             else:
                 w1, w1_scale, w2, w2_scale = self._get_mlp_weights(layer)
             return MoEWeights(

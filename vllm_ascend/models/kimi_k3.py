@@ -57,12 +57,6 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
-from vllm_ascend.models.common.ops.sequence_parallel import (
-    sp_all_gather,
-    sp_padding_mask,
-    sp_reduce_scatter,
-    sp_shard,
-)
 from vllm.models.kimi_k3.amd.linear import (
     KimiDecoderLayer as UpstreamKimiDecoderLayer,
 )
@@ -93,8 +87,15 @@ from vllm.utils.math_utils import cdiv
 
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_forward_context import register_kimi_moe_quant_type
 from vllm_ascend.attention.utils import mark_fused_preprocess_weights
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.models.common.ops.sequence_parallel import (
+    sp_all_gather,
+    sp_padding_mask,
+    sp_reduce_scatter,
+    sp_shard,
+)
 from vllm_ascend.ops.fused_moe.shared_experts import AscendSharedSparseSituAndMul
 from vllm_ascend.ops.kimi_attn_res import (
     AttnResBackend,
@@ -343,6 +344,14 @@ def is_moe_layer_idx(config, layer_idx: int) -> bool:
     )
 
 
+def _get_kimi_router_stream(vllm_config: VllmConfig) -> torch.npu.Stream | None:
+    if not get_ascend_config().multistream_overlap_shared_expert:
+        return None
+    if not hasattr(vllm_config, "_kimi_router_stream"):
+        vllm_config._kimi_router_stream = torch.npu.Stream()
+    return vllm_config._kimi_router_stream
+
+
 class AscendKimiMoE(nn.Module):
     """Kimi K3 MoE assembled from the standard vLLM MoE interfaces."""
 
@@ -479,7 +488,7 @@ class AscendKimiMoE(nn.Module):
         object.__setattr__(
             self.experts,
             "_kimi_router_stream",
-            torch.npu.Stream() if get_ascend_config().multistream_overlap_shared_expert else None,
+            _get_kimi_router_stream(vllm_config),
         )
         if self.shared_experts is not None and get_ascend_config().multistream_overlap_shared_expert:
             # Share a communication stream across this model's MoE layers;
@@ -1482,6 +1491,9 @@ class AscendKimiK3ForConditionalGeneration(UpstreamKimiK3ForConditionalGeneratio
                 prefix=maybe_prefix(prefix, "language_model"),
                 architectures=["KimiLinearForCausalLM"],
             )
+        language_layouts = getattr(self.language_model.model_config, "_ascend_kimi_moe_quant_types", ())
+        for quant_type in language_layouts:
+            register_kimi_moe_quant_type(vllm_config, quant_type)
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.language_model.make_empty_intermediate_tensors
         )

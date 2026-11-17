@@ -527,9 +527,15 @@ class FusedMC2CommImpl(MoECommMethod):
         # they are passed through as-is here. W8A8 weights are already int8 + FRACTAL_NZ, also as-is.
         weight_scales1 = weights.w1_scale
         weight_scales2 = weights.w2_scale
+        quant_type = fused_experts_input.quant.quant_type
         dispatch_quant_mode, dispatch_quant_out_dtype, weight_type = moe_utils._get_cann_mega_moe_quant_settings(
-            fused_experts_input.quant.quant_type
+            quant_type
         )
+        if quant_type in (QuantType.W4A8MXFP, QuantType.W4A4MXFP):
+            # CANN expects packed FP4 bytes with an explicit weight_type. Keep the
+            # native FP4 dtype needed by SiTU on the original weights.
+            weight1 = [w.view(torch.uint8) if w.dtype == torch.float4_e2m1fn_x2 else w for w in weight1]
+            weight2 = [w.view(torch.uint8) if w.dtype == torch.float4_e2m1fn_x2 else w for w in weight2]
 
         if self.mega_moe_symm_buffer is None:
             self.mega_moe_symm_buffer = self._init_mega_moe_symm_buffer(

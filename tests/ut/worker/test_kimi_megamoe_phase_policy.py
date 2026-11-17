@@ -45,7 +45,9 @@ def load_policy():
         "set_mc2_tokens_capacity",
         "register_kimi_moe_quant_type",
         "_is_kimi_moe_model",
+        "_is_kv_consumer_only",
         "_kimi_megamoe_weights_supported",
+        "log_kimi_megamoe_config",
     }
     nodes += [
         n
@@ -211,10 +213,68 @@ class TestKimiMegaMoEPhase(unittest.TestCase):
         self.batch(["D", "I"], [8, 1], "MC2")
         self.batch(["P", "D"], [128, 8], "ALLTOALL")
 
+    def test_v1_mixed_deployment_reports_prefill_and_decode_selection(self):
+        for kv_config in (None, NS(kv_role="kv_both", is_kv_consumer=True, is_kv_producer=True)):
+            with self.subTest(kv_config=kv_config):
+                self.config.kv_transfer_config = kv_config
+                for contains_decode, expected in ((False, "FUSED_MC2"), (True, "MC2"), (False, "FUSED_MC2")):
+                    result = self.ns["select_moe_comm_method"](8, self.config, batch_contains_decode=contains_decode)
+                    self.assertEqual(result.name, expected)
+                    self.ns["logger"].info_once.assert_called()
+                    message, *arguments = self.ns["logger"].info_once.call_args.args
+                    output = message % tuple(arguments)
+                    self.assertIn("Kimi V1 MoE selection:", output)
+                    self.assertIn(f"method=MoECommType.{expected}", output)
+                    self.assertIn(f"contains_decode={contains_decode}", output)
+                    self.assertIn("over_capacity=False", output)
+
+    def test_v1_config_diagnostic_reports_legacy_eplb_and_placement_guards(self):
+        for dynamic, redundancy, mix in ((True, 0, False), (False, 8, False), (False, 0, True)):
+            with self.subTest(dynamic=dynamic, redundancy=redundancy, mix=mix):
+                self.ascend.eplb_config = NS(dynamic_eplb=dynamic, num_redundant_experts=redundancy)
+                self.ascend.mix_placement = mix
+                self.ns["logger"].reset_mock()
+                result = self.ns["select_moe_comm_method"](8, self.config, batch_contains_decode=False)
+                self.assertEqual(result.name, "MC2")
+                self.assertEqual(self.ns["logger"].info_once.call_count, 2)
+                config_call, _ = self.ns["logger"].info_once.call_args_list
+                message, *arguments = config_call.args
+                output = message % tuple(arguments)
+                self.assertIn("Kimi V1 MegaMoE config:", output)
+                self.assertIn("weights_supported=False", output)
+                self.assertIn(f"dynamic_eplb={dynamic}", output)
+                self.assertIn(f"ascend_redundant_experts={redundancy}", output)
+                self.assertIn(f"mix_placement={mix}", output)
+                self.assertEqual(config_call.kwargs, {"scope": "process"})
+
+    def test_v1_selection_diagnostic_reports_graph_and_capacity_fallback(self):
+        for tokens, mode, expected, over_capacity in (
+            (8, GraphMode.FULL, "MC2", False),
+            (128, GraphMode.NONE, "ALLTOALL", True),
+        ):
+            with self.subTest(tokens=tokens, mode=mode):
+                result = self.ns["select_moe_comm_method"](
+                    tokens, self.config, batch_contains_decode=False, aclgraph_runtime_mode=mode
+                )
+                self.assertEqual(result.name, expected)
+                self.ns["logger"].info_once.assert_called()
+                message, *arguments = self.ns["logger"].info_once.call_args.args
+                output = message % tuple(arguments)
+                self.assertIn(f"graph_mode={mode}", output)
+                self.assertIn(f"over_capacity={over_capacity}", output)
+
     def test_pd_last_prompt_token_recompute_keeps_decode_graph(self):
         self.config.kv_transfer_config = NS(is_kv_consumer=True)
         self.ns["is_pd_decode_recompute_scheduler_enabled"] = lambda cfg: True
         self.batch(["R", "I"], [1, 1], "MC2")
+
+    def test_v1_diagnostics_tolerate_uninitialized_capacity(self):
+        self.ns["get_mc2_tokens_capacity"] = lambda: None
+        self.ns["get_ep_group"] = lambda: NS(world_size=1)
+        result = self.ns["select_moe_comm_method"](8, self.config, batch_contains_decode=False)
+        self.assertEqual(result.name, "ALLGATHER")
+        message, *arguments = self.ns["logger"].info_once.call_args.args
+        self.assertIn("over_capacity=None", message % tuple(arguments))
 
     def test_missing_cann_backend_cannot_select_fused_mc2_for_kimi(self):
         self.ns["use_cann_megamoe"] = lambda cfg: False
@@ -270,7 +330,7 @@ class TestKimiMegaMoEPhase(unittest.TestCase):
         self.config.model_config._ascend_kimi_moe_quant_types = frozenset((self.ns["QuantType"].NONE,))
         self.assertEqual(select(2048, self.config, batch_contains_decode=False).name, "ALLTOALL")
 
-    def test_capture_v2_and_kv_consumer_reject_megamoe(self):
+    def test_capture_uncoordinated_v2_and_kv_consumer_reject_megamoe(self):
         select = self.ns["select_moe_comm_method"]
         for mode in (GraphMode.FULL, GraphMode.PIECEWISE):
             self.assertEqual(
@@ -280,6 +340,12 @@ class TestKimiMegaMoEPhase(unittest.TestCase):
             c = NS(**(vars(self.config) | kwargs))
             self.assertEqual(select(8, c, batch_contains_decode=False).name, "MC2")
         self.batch(["I", "I"], [8, 8], "MC2")
+
+    def test_v2_requires_explicit_prefill_agreement(self):
+        self.config.use_v2_model_runner = True
+        select = self.ns["select_moe_comm_method"]
+        self.assertEqual(select(8, self.config, batch_contains_decode=False, v2_prefill_ready=True).name, "FUSED_MC2")
+        self.assertEqual(select(8, self.config, batch_contains_decode=True, v2_prefill_ready=True).name, "MC2")
 
     def test_non_kimi_and_dense_draft_keep_030_policy(self):
         self.config.model_config.architectures = ["OtherMoE"]

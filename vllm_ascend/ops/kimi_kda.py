@@ -52,8 +52,8 @@ from vllm_ascend.ops.kimi_mega_kda import (
     MegaKDAWeights,
     ensure_mega_kda_bf16,
     ensure_mega_kda_nd,
-    load_mega_kda_operator,
     load_commit_recurrent_kda_operator,
+    load_mega_kda_operator,
     mega_kda_nz_operand,
     run_commit_recurrent_kda,
     run_mega_recurrent_kda,
@@ -862,8 +862,11 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             and all(stride > 0 for stride in state.stride())
             for state, dtype in zip(self.kv_cache[2:5], (torch.float32, torch.float16, torch.float32))
         )
-        return replay_supported and conv.stride(-1) == 1 and recurrent.stride(-1) == 1 and all(
-            stride > 0 for stride in (*conv.stride(), *recurrent.stride())
+        return (
+            replay_supported
+            and conv.stride(-1) == 1
+            and recurrent.stride(-1) == 1
+            and all(stride > 0 for stride in (*conv.stride(), *recurrent.stride()))
         )
 
     def _build_mega_weights(self) -> MegaKDAWeights:
@@ -1650,10 +1653,20 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             maybe_save_kv_layer_to_connector("", [])
             return
 
-        # Reuse the caller-owned result buffer. FULL graphs can leave rows
-        # outside the live spec/non-spec index sets, so define them before the
-        # two index copies rather than allocating a temporary merged tensor.
-        core_attn_out[:, :num_actual_tokens].zero_()
+        norm_out = core_attn_out[:, :num_actual_tokens]
+        # Pure prefill overwrites every live element. Keep clearing other
+        # batches: FULL graphs can leave gaps in the spec/non-spec index sets.
+        prefill_covers_output = (
+            attn_metadata.num_prefills > 0
+            and attn_metadata.num_decodes == 0
+            and attn_metadata.num_spec_decodes == 0
+            and spec_masks is None
+            and core_spec is None
+            and core_non_spec is not None
+            and core_non_spec.shape == norm_out.shape
+        )
+        if not prefill_covers_output:
+            norm_out.zero_()
         if core_spec is not None and core_non_spec is not None:
             assert spec_token_indices is not None
             assert non_spec_token_indices is not None
@@ -1667,7 +1680,6 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
 
         # Keep the registered norm's parameters while writing into the
         # caller-owned attention output directly.
-        norm_out = core_attn_out[:, :num_actual_tokens]
         self.o_norm.forward_oot(norm_out, g2, out=norm_out)
         core_attn_out[:, num_actual_tokens:].zero_()
         maybe_save_kv_layer_to_connector("", [])

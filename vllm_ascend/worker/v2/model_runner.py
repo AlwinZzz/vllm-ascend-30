@@ -33,7 +33,6 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import async_tensor_h2d as async_copy_to_gpu
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.dp_utils import skip_dp_coordination
 from vllm.v1.worker.gpu import model_runner as vllm_model_runner
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -107,7 +106,7 @@ from vllm_ascend.utils import (
     should_skip_allreduce_across_dp_group,
 )
 from vllm_ascend.worker.device_metadata import TargetDeviceMetadata
-from vllm_ascend.worker.utils import disable_compilation, profile_worker_stage
+from vllm_ascend.worker.utils import disable_compilation
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import (
     build_attn_state,
@@ -649,7 +648,7 @@ class NPUModelRunner(GPUModelRunner):
             if uses_kimi_prefill_megamoe(self.vllm_config) and not _is_kv_consumer_only(self.vllm_config)
             else nullcontext()
         )
-        with record_function_or_nullcontext("ascend::mrv2.execute_model"), dp_coordination_context, moe_context:
+        with dp_coordination_context, moe_context:
             try:
                 output = super().execute_model(
                     scheduler_output,
@@ -666,8 +665,7 @@ class NPUModelRunner(GPUModelRunner):
                 if finish_execution is not None:
                     finish_execution(failed=forward_failed)
         if not dummy_run and not is_profile:
-            with record_function_or_nullcontext("ascend::mrv2.send_draft_kv"):
-                self._maybe_send_draft_kv(scheduler_output)
+            self._maybe_send_draft_kv(scheduler_output)
         self.model_state.kvpp_is_dummy_run = False
         if dummy_run and lmhead_tp_enable() and not is_profile and self.is_last_pp_rank:
             # lmhead TP: idle ranks never call sample(); join the target head
@@ -775,8 +773,7 @@ class NPUModelRunner(GPUModelRunner):
         self.mega_kda_nd_released_bytes = release_mega_kda_nd_weights(self.model)
 
     def gather_batch_req_state(self, scheduler_output: SchedulerOutput, dummy_run: bool):
-        with record_function_or_nullcontext("ascend::mrv2.gather_batch_req_state"):
-            batch_state, uniform_token_count = super().gather_batch_req_state(scheduler_output, dummy_run)
+        batch_state, uniform_token_count = super().gather_batch_req_state(scheduler_output, dummy_run)
         kv_cfg = self.vllm_config.kv_transfer_config
         is_pd_decode_node = kv_cfg is not None and kv_cfg.is_kv_consumer and not kv_cfg.is_kv_producer
         if batch_state is not None and is_pd_decode_node:
@@ -814,7 +811,6 @@ class NPUModelRunner(GPUModelRunner):
                 "scheduled locally — a request sent directly to the decode node)."
             )
 
-    @profile_worker_stage("ascend::mrv2.prepare_inputs")
     def prepare_inputs(  # type: ignore[misc]
         self,
         scheduler_output: SchedulerOutput,
@@ -839,12 +835,7 @@ class NPUModelRunner(GPUModelRunner):
 
         req_ids = batch_req_state.req_ids
 
-        prefill_computed_tokens = self._get_prompt_computed_tokens(scheduler_output, batch_req_state)
-        length_scope = (
-            "ascend::mrv2.prompt_cpu_lengths" if prefill_computed_tokens is not None else "ascend::mrv2.cpu_lengths"
-        )
-        with record_function_or_nullcontext(length_scope):
-            self._update_seq_lens_cpu(scheduler_output, req_ids, prefill_computed_tokens=prefill_computed_tokens)
+        self._update_seq_lens_cpu(scheduler_output, req_ids)
 
         num_scheduled_tokens_np = batch_req_state.num_scheduled_tokens
         idx_mapping_np = batch_req_state.idx_mapping_np
@@ -1014,11 +1005,7 @@ class NPUModelRunner(GPUModelRunner):
 
         # CPU upper bound on seq_lens (num_computed_tokens + num_scheduled_tokens).
         # Added by vLLM PR #40654 to avoid GPU->CPU sync for seq_lens.
-        num_computed_tokens_np = (
-            prefill_computed_tokens
-            if prefill_computed_tokens is not None
-            else self.req_states.num_computed_tokens_np[idx_mapping_np]
-        )
+        num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]
         seq_lens_cpu_upper_bound_np = np.zeros(num_reqs_padded, dtype=np.int32)
         np.add(
             num_computed_tokens_np,
@@ -1342,63 +1329,12 @@ class NPUModelRunner(GPUModelRunner):
             )
             self.num_computed_tokens_event.record()
 
-    def _get_prompt_computed_tokens(
-        self, scheduler_output: SchedulerOutput, batch_req_state: BatchReqState
-    ) -> np.ndarray | None:
-        """Return exact prompt progress without waiting for a device snapshot.
-
-        Unlike decode's optimistic counts, a batch entirely inside the prompt
-        cannot reject tokens. Use its gathered CPU snapshot, including prefix
-        cache hits, rather than an older D2H mirror. Exclude prompt lookahead
-        and retain the audited synchronization contract for other execution
-        modes and models.
-        """
-        if getattr(self.model_config, "architecture", None) not in {
-            "KimiLinearForCausalLM",
-            "KimiK3ForCausalLM",
-            "KimiK3ForConditionalGeneration",
-        }:
-            return None
-        parallel = self.vllm_config.parallel_config
-        if (
-            parallel.pipeline_parallel_size != 1
-            or parallel.prefill_context_parallel_size != 1
-            or parallel.decode_context_parallel_size != 1
-            or self.adaptive_verification is not None
-            or self.ascend_config.sparse_kv_offload_config.enabled
-            or self.ascend_config.kvpp_config.size != 1
-            or scheduler_output.scheduled_spec_decode_tokens
-        ):
-            return None
-        num_reqs = len(batch_req_state.req_ids)
-        computed = batch_req_state.num_computed_prefill_tokens_np
-        prefill_len = batch_req_state.prefill_len_np
-        scheduled = batch_req_state.num_scheduled_tokens
-        if (
-            num_reqs == 0
-            or any(values.shape != (num_reqs,) for values in (computed, prefill_len, scheduled))
-            or not np.all(batch_req_state.is_prefilling_np)
-            or not np.all((computed >= 0) & (scheduled > 0) & (scheduled <= prefill_len - computed))
-        ):
-            return None
-        return computed.copy()
-
     def _update_seq_lens_cpu(
         self,
         scheduler_output: SchedulerOutput,
         req_ids: list[str],
-        *,
-        prefill_computed_tokens: np.ndarray | None = None,
     ):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
-
-        if prefill_computed_tokens is not None:
-            scheduled = np.fromiter((num_scheduled_tokens[req_id] for req_id in req_ids), dtype=np.int32)
-            np.add(prefill_computed_tokens, scheduled, out=self.input_buffers.seq_lens_np[: len(req_ids)])
-            # Do not publish these batch-local counts into request state or
-            # consume the shared D2H snapshot. A later decode may still need
-            # its rejection-corrected values, including unscheduled requests.
-            return
 
         # Keep the exact host mirror for consumers such as FIA and PCP.
         # Device-length backends retain the scheduler's CPU upper bound.

@@ -1,6 +1,5 @@
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from functools import wraps
 from typing import Any
 
 import torch
@@ -9,25 +8,9 @@ from vllm.utils.math_utils import largest_power_of_2_divisor
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec
-from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
 
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
-
-
-def profile_worker_stage(name: str) -> Callable:
-    """Label an entire host stage, including Python work between torch ops."""
-
-    def decorate(func: Callable) -> Callable:
-        @wraps(func)
-        def wrapped(*args, **kwargs):
-            # Use a fresh context on every call; no shared event or sync.
-            with record_function_or_nullcontext(name):
-                return func(*args, **kwargs)
-
-        return wrapped
-
-    return decorate
 
 
 def copy_kv_cache_blocks_inplace(

@@ -7,7 +7,7 @@ upstream vLLM.  Only the CUDA-specific convolution and KDA execution is
 replaced here with the Ascend metadata builder and AscendC operators.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import wraps
 from typing import Any
 
@@ -410,6 +410,20 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
     # Worker startup prepares this layer after KV-cache binding.
     _requires_kda_state_copy = True
 
+    def get_kv_cache_spec(self, vllm_config):
+        spec = super().get_kv_cache_spec(vllm_config)
+        if spec is None or not self.use_mega_kda_replayssm:
+            return spec
+        producer = self._mega_pd_prefill_worker
+        consumer = self._mega_pd_decode_worker
+        if producer == consumer:
+            return spec
+        if consumer:
+            layers = vllm_config.compilation_config.static_forward_context.values()
+            if any(isinstance(layer, AscendKimiK3DeltaAttention) and layer._mega_weights is None for layer in layers):
+                return spec
+        return replace(spec, num_speculative_blocks=0)
+
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         # Build the canonical two-state KDA cache directly.  Upstream vLLM
         # may enable its CUDA RecoverSSM records from speculative decoding;
@@ -722,12 +736,19 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             return self.o_proj(core_attn_out)[0]
         return super().forward(hidden_states, positions)
 
+    def _get_kda_forward_metadata(self):
+        # Both callers execute inside the runtime/custom-op boundary, never tracing.
+        raw = get_forward_context().attn_metadata
+        prelaunch = getattr(self, "_kimi_c8_metadata_prelaunch", None)
+        if prelaunch is not None and isinstance(raw, dict):
+            prelaunch(raw)
+        return raw
+
     def _plan_mega_kda(self, hidden_states: torch.Tensor, *, num_tokens: int | None = None) -> _MegaKDAPlan | None:
         """Resolve a supported decode/verify batch before touching state."""
         if self._mega_weights is None or hidden_states.dtype != torch.bfloat16:
             return None
-        context = get_forward_context()
-        raw = context.attn_metadata
+        raw = self._get_kda_forward_metadata()
         if not isinstance(raw, dict) or self.prefix not in raw:
             return None
         metadata = raw[self.prefix]
@@ -781,8 +802,6 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         if state_indices.ndim not in (1, 2) or state_indices.shape[0] != batch:
             return None
         if state_indices.ndim == 1 and spec_len != 1:
-            return None
-        if state_indices.ndim == 2 and state_indices.shape[1] < spec_len:
             return None
         if accepted.numel() < batch:
             return None
@@ -1438,8 +1457,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         beta_is_preprocessed: bool = False,
     ) -> None:
         """Dispatch speculative, prefill, and decode tokens through KDA kernels."""
-        forward_context = get_forward_context()
-        attn_metadata_raw = forward_context.attn_metadata
+        attn_metadata_raw = self._get_kda_forward_metadata()
         if attn_metadata_raw is None:
             core_attn_out.zero_()
             return

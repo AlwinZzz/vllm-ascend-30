@@ -59,7 +59,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
-from vllm.v1.utils import report_usage_stats
+from vllm.v1.utils import record_function_or_nullcontext, report_usage_stats
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
@@ -817,9 +817,11 @@ class NPUWorker(WorkerBase):
             )
 
         if self.profiler is not None:
-            self.profiler.step()
+            with record_function_or_nullcontext("ascend::worker.profiler_step"):
+                self.profiler.step()
 
-        output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        with record_function_or_nullcontext("ascend::worker.execute_model"):
+            output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
         if self.use_v2_model_runner and self.model_runner.is_pooling_model and output is None:
             output = self.model_runner.pool()  # type: ignore
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
@@ -857,7 +859,8 @@ class NPUWorker(WorkerBase):
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        output = self.model_runner.sample_tokens(grammar_output)
+        with record_function_or_nullcontext("ascend::worker.sample_tokens"):
+            output = self.model_runner.sample_tokens(grammar_output)
         _attach_profiling_chunk_execution_time(
             self.model_runner.ascend_config.scheduler_config.profiling_chunk_config,
             self.model_runner,

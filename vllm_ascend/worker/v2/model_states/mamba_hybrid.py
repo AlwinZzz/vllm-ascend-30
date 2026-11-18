@@ -38,6 +38,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ops.gdn_attn_builder import AscendMegaKDAHostMetadataBuilder
 from vllm_ascend.ops.kimi_mega_kda import MegaKDAFirstVerifyTracker
+from vllm_ascend.worker.utils import profile_worker_stage
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
@@ -112,9 +113,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
     def _with_mega_request_history(self, input_batch, metadata, for_capture):
         tracker = getattr(self, "_mega_request_tracker", None)
         replay_enabled = bool(
-            (getattr(self.vllm_config, "additional_config", None) or {}).get(
-                "enable_mega_kda_replayssm", False
-            )
+            (getattr(self.vllm_config, "additional_config", None) or {}).get("enable_mega_kda_replayssm", False)
         )
         if (tracker is None and not replay_enabled) or for_capture:
             return metadata
@@ -348,6 +347,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             self._pending_bulk_copy = None
         super().finish_execution(failed=failed)
 
+    @profile_worker_stage("ascend::mrv2.prepare_attn")
     def prepare_attn(
         self,
         input_batch: AscendInputBatch,
